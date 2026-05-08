@@ -1,0 +1,244 @@
+import logging
+from aiogram import Router, F, Bot
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+from config import Config
+from post_manager import (
+    create_and_send_post,
+    publish_to_channel,
+    pending_posts,
+    get_preview_keyboard,
+)
+from ai_generator import generate_vpn_news
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+# Load config once for use in handlers
+_config: Config | None = None
+
+
+def get_config() -> Config:
+    global _config
+    if _config is None:
+        _config = Config()
+    return _config
+
+
+class EditState(StatesGroup):
+    waiting_for_text = State()
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in get_config().ADMIN_IDS
+
+
+# ─── /start ───────────────────────────────────────────────────────────────────
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    config = get_config()
+    await message.answer(
+        "🤖 <b>Titul VPN — Новостной бот</b>\n\n"
+        "Я автоматически генерирую VPN-новости с помощью ИИ "
+        f"и публикую их в канал каждые <b>{config.POST_INTERVAL_HOURS} ч.</b>\n\n"
+        "📋 <b>Команды:</b>\n"
+        "/post — создать пост прямо сейчас\n"
+        "/status — статус бота\n"
+        "/autopublish — вкл/выкл превью перед публикацией\n"
+        "/interval — изменить интервал постинга\n"
+        "/help — справка",
+        parse_mode="HTML"
+    )
+
+
+# ─── /help ────────────────────────────────────────────────────────────────────
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "📖 <b>Справка</b>\n\n"
+        "<b>/post</b> — сгенерировать и отправить пост на превью\n"
+        "<b>/status</b> — посмотреть текущие настройки\n"
+        "<b>/autopublish</b> — переключить режим авто-публикации (без превью)\n"
+        "<b>/interval [часы]</b> — изменить интервал, например /interval 2.5\n\n"
+        "🔘 <b>Кнопки в превью:</b>\n"
+        "✅ Опубликовать — отправить пост в канал\n"
+        "✏️ Редактировать — изменить текст поста\n"
+        "🔄 Перегенерировать — создать новый вариант\n"
+        "🗑 Отменить — не публиковать",
+        parse_mode="HTML"
+    )
+
+
+# ─── /status ──────────────────────────────────────────────────────────────────
+
+@router.message(Command("status"))
+async def cmd_status(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    config = get_config()
+    mode = "✅ Превью перед публикацией" if config.PREVIEW_BEFORE_POST else "⚡ Авто-публикация без превью"
+    await message.answer(
+        f"📊 <b>Статус бота</b>\n\n"
+        f"📢 Канал: <code>{config.CHANNEL_ID}</code>\n"
+        f"⏱ Интервал: каждые <b>{config.POST_INTERVAL_HOURS} ч.</b>\n"
+        f"🔘 Режим: {mode}\n"
+        f"👤 Ожидает публикации: {len(pending_posts)} пост(ов)",
+        parse_mode="HTML"
+    )
+
+
+# ─── /post ────────────────────────────────────────────────────────────────────
+
+@router.message(Command("post"))
+async def cmd_post(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    config = get_config()
+    bot = message.bot
+    wait_msg = await message.answer("⏳ Генерирую пост, подожди немного...")
+    await create_and_send_post(bot, config, manual=True)
+    await wait_msg.delete()
+
+
+# ─── /autopublish ─────────────────────────────────────────────────────────────
+
+@router.message(Command("autopublish"))
+async def cmd_autopublish(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    config = get_config()
+    config.PREVIEW_BEFORE_POST = not config.PREVIEW_BEFORE_POST
+    status = "✅ включено (с превью)" if config.PREVIEW_BEFORE_POST else "⚡ выключено (авто без превью)"
+    await message.answer(f"🔘 Превью перед публикацией: <b>{status}</b>", parse_mode="HTML")
+
+
+# ─── /interval ────────────────────────────────────────────────────────────────
+
+@router.message(Command("interval"))
+async def cmd_interval(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Укажи интервал в часах. Пример: <code>/interval 2.5</code>", parse_mode="HTML")
+        return
+    try:
+        hours = float(args[1])
+        if hours < 0.25 or hours > 24:
+            await message.answer("⚠️ Интервал должен быть от 0.25 до 24 часов.")
+            return
+        config = get_config()
+        config.POST_INTERVAL_HOURS = hours
+        await message.answer(
+            f"✅ Интервал изменён на <b>{hours} ч.</b>\n"
+            f"⚠️ Изменение вступит в силу после перезапуска бота.\n"
+            f"Обнови переменную <code>POST_INTERVAL_HOURS={hours}</code> в .env",
+            parse_mode="HTML"
+        )
+    except ValueError:
+        await message.answer("❌ Неверный формат. Пример: <code>/interval 1.5</code>", parse_mode="HTML")
+
+
+# ─── Callbacks ────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "publish_post")
+async def cb_publish(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    config = get_config()
+    post_text = pending_posts.get(callback.from_user.id)
+    if not post_text:
+        await callback.answer("⚠️ Пост не найден.", show_alert=True)
+        return
+
+    success = await publish_to_channel(callback.bot, config, post_text)
+    if success:
+        pending_posts.pop(callback.from_user.id, None)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer("✅ <b>Пост опубликован в канал!</b>", parse_mode="HTML")
+    else:
+        await callback.answer("❌ Ошибка публикации. Проверь логи.", show_alert=True)
+
+
+@router.callback_query(F.data == "edit_post")
+async def cb_edit(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    post_text = pending_posts.get(callback.from_user.id)
+    if not post_text:
+        await callback.answer("⚠️ Пост не найден.", show_alert=True)
+        return
+
+    await state.set_state(EditState.waiting_for_text)
+    await callback.message.answer(
+        "✏️ <b>Отправь отредактированный текст поста</b>\n\n"
+        "Используй HTML-теги: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;a href=''&gt;</code>\n"
+        "Или /cancel для отмены.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.message(EditState.waiting_for_text)
+async def receive_edited_post(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Редактирование отменено.")
+        return
+
+    new_text = message.text or message.caption or ""
+    if not new_text:
+        await message.answer("⚠️ Пустой текст. Попробуй ещё раз или /cancel")
+        return
+
+    pending_posts[message.from_user.id] = new_text
+    await state.clear()
+    await message.answer(
+        f"📝 <b>Обновлённый пост:</b>\n\n{new_text}\n\n{'—'*30}\n\nЧто делаем?",
+        parse_mode="HTML",
+        reply_markup=get_preview_keyboard(new_text)
+    )
+
+
+@router.callback_query(F.data == "regen_post")
+async def cb_regen(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    config = get_config()
+    await callback.message.answer("⏳ Генерирую новый вариант поста...")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    try:
+        new_text = await generate_vpn_news(config.ANTHROPIC_API_KEY)
+        pending_posts[callback.from_user.id] = new_text
+        await callback.message.answer(
+            f"🔄 <b>Новый вариант:</b>\n\n{new_text}\n\n{'—'*30}\n\nЧто делаем?",
+            parse_mode="HTML",
+            reply_markup=get_preview_keyboard(new_text)
+        )
+    except Exception as e:
+        await callback.message.answer(f"❌ Ошибка генерации: <code>{e}</code>", parse_mode="HTML")
+
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cancel_post")
+async def cb_cancel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    pending_posts.pop(callback.from_user.id, None)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("🗑 Пост отменён.")
+    await callback.answer()
