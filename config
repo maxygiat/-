@@ -1,0 +1,27 @@
+import os
+from dataclasses import dataclass, field
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+@dataclass
+class Config:
+    BOT_TOKEN: str = field(default_factory=lambda: os.getenv("BOT_TOKEN", ""))
+    ANTHROPIC_API_KEY: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
+    CHANNEL_ID: str = field(default_factory=lambda: os.getenv("CHANNEL_ID", ""))       # e.g. @TitulVPN or -100xxxxxxx
+    ADMIN_IDS: list[int] = field(default_factory=lambda: [
+        int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+    ])
+    POST_INTERVAL_HOURS: float = field(default_factory=lambda: float(os.getenv("POST_INTERVAL_HOURS", "1.5")))
+    PREVIEW_BEFORE_POST: bool = field(default_factory=lambda: os.getenv("PREVIEW_BEFORE_POST", "true").lower() == "true")
+
+    def __post_init__(self):
+        if not self.BOT_TOKEN:
+            raise ValueError("BOT_TOKEN is required")
+        if not self.ANTHROPIC_API_KEY:
+            raise ValueError("ANTHROPIC_API_KEY is required")
+        if not self.CHANNEL_ID:
+            raise ValueError("CHANNEL_ID is required")
+        if not self.ADMIN_IDS:
+            raise ValueError("ADMIN_IDS is required — set your Telegram user ID")
