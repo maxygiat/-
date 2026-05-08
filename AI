@@ -1,0 +1,121 @@
+import anthropic
+import logging
+import json
+import random
+
+logger = logging.getLogger(__name__)
+
+# Premium emoji IDs for Telegram (these are actual Telegram premium emoji IDs)
+# Format for use in HTML: <tg-emoji emoji-id="ID">FALLBACK</tg-emoji>
+PREMIUM_EMOJIS = {
+    "fire":    ("5368324170671202286", "🔥"),
+    "shield":  ("5368324170671202286", "🛡"),
+    "vpn":     ("5472354553527045544", "🔒"),
+    "news":    ("5431815452437257407", "📰"),
+    "globe":   ("5440539497383087970", "🌐"),
+    "star":    ("5447644880824181073", "⭐"),
+    "rocket":  ("5445267414562389170", "🚀"),
+    "warning": ("5447183459602669338", "⚠️"),
+    "check":   ("5445284980978621387", "✅"),
+    "eye":     ("5469791106320032139", "👁"),
+}
+
+USED_TOPICS_FILE = "used_topics.json"
+
+
+def pe(key: str) -> str:
+    """Return premium emoji HTML tag with fallback."""
+    emoji_id, fallback = PREMIUM_EMOJIS.get(key, ("", "•"))
+    if emoji_id:
+        return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+    return fallback
+
+
+def load_used_topics() -> list[str]:
+    try:
+        with open(USED_TOPICS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_used_topics(topics: list[str]):
+    # Keep only last 50 to avoid repetition but allow cycling
+    with open(USED_TOPICS_FILE, "w", encoding="utf-8") as f:
+        json.dump(topics[-50:], f, ensure_ascii=False)
+
+
+async def generate_vpn_news(api_key: str) -> str:
+    """Generate a VPN news post using Claude AI with web search."""
+    client = anthropic.Anthropic(api_key=api_key)
+
+    used_topics = load_used_topics()
+    avoid_str = ""
+    if used_topics:
+        avoid_str = f"\n\nИЗБЕГАЙ этих тем (уже публиковались): {', '.join(used_topics[-10:])}"
+
+    system_prompt = """Ты — редактор Telegram-канала "Titul VPN" о VPN-технологиях и интернет-свободе.
+Твоя задача — написать актуальный информативный пост на русском языке.
+
+Тематика постов:
+- Новости о блокировках и цензуре в интернете (Россия, СНГ, мир)
+- Обновления популярных VPN-сервисов (Outline, Amnezia, Lantern, Psiphon и др.)
+- Безопасность и приватность в сети
+- Новые законы и регуляции о VPN
+- Технические новинки (WireGuard, VLESS, Shadowsocks и др.)
+- Советы по обходу блокировок
+
+Формат поста (строго HTML для Telegram):
+- Длина: 150-300 слов
+- Начни с эмодзи и броского заголовка жирным текстом
+- Используй <b>жирный</b> для ключевых слов
+- Используй <i>курсив</i> для важных деталей
+- В конце добавь хештеги: #VPN #ТитулVPN #интернет и 1-2 тематических
+- НЕ используй markdown, только HTML теги
+- Пиши живо и интересно, как настоящий редактор канала
+
+ВАЖНО: Верни ТОЛЬКО текст поста без каких-либо пояснений."""
+
+    user_prompt = f"""Напиши свежий пост о VPN-новостях для Telegram-канала.
+Используй веб-поиск чтобы найти реальные актуальные новости о VPN, блокировках, приватности в интернете за последние дни.
+{avoid_str}
+
+После написания поста, в самом конце на новой строке добавь JSON в формате:
+TOPIC_JSON:{{"topic": "краткое описание темы поста в 3-5 слов"}}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            tools=[{"type": "web_search_20250305", "name": "web_search"}]
+        )
+
+        # Extract text from response
+        full_text = ""
+        for block in response.content:
+            if block.type == "text":
+                full_text += block.text
+
+        # Extract topic for deduplication
+        topic = "общая тема"
+        if "TOPIC_JSON:" in full_text:
+            parts = full_text.split("TOPIC_JSON:")
+            full_text = parts[0].strip()
+            try:
+                topic_data = json.loads(parts[1].strip())
+                topic = topic_data.get("topic", "общая тема")
+            except Exception:
+                pass
+
+        # Save used topic
+        used_topics.append(topic)
+        save_used_topics(used_topics)
+
+        logger.info("✅ Пост сгенерирован. Тема: %s", topic)
+        return full_text.strip()
+
+    except Exception as e:
+        logger.error("Ошибка генерации поста: %s", e)
+        raise
