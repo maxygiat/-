@@ -1,0 +1,80 @@
+import logging
+import json
+from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+from config import Config
+from ai_generator import generate_vpn_news
+
+logger = logging.getLogger(__name__)
+
+# In-memory store for pending posts {admin_id: post_text}
+pending_posts: dict[int, str] = {}
+
+
+def get_preview_keyboard(post_text: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Опубликовать", callback_data="publish_post"),
+            InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_post"),
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Перегенерировать", callback_data="regen_post"),
+            InlineKeyboardButton(text="🗑 Отменить", callback_data="cancel_post"),
+        ]
+    ])
+
+
+async def create_and_send_post(bot: Bot, config: Config, manual: bool = False):
+    """Generate a post and send preview to all admins."""
+    logger.info("🤖 Генерирую новый пост VPN-новостей...")
+
+    try:
+        post_text = await generate_vpn_news(config.ANTHROPIC_API_KEY)
+    except Exception as e:
+        logger.error("Не удалось сгенерировать пост: %s", e)
+        for admin_id in config.ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, f"❌ Ошибка генерации поста:\n<code>{e}</code>", parse_mode="HTML")
+            except Exception:
+                pass
+        return
+
+    if config.PREVIEW_BEFORE_POST:
+        # Send preview to admins
+        for admin_id in config.ADMIN_IDS:
+            pending_posts[admin_id] = post_text
+            try:
+                source = "🕐 Автоматический пост по расписанию" if not manual else "👤 Ручной запрос"
+                await bot.send_message(
+                    admin_id,
+                    f"📝 <b>Превью поста</b> ({source})\n\n"
+                    f"{'—' * 30}\n\n"
+                    f"{post_text}\n\n"
+                    f"{'—' * 30}\n\n"
+                    f"Что делаем с постом?",
+                    parse_mode="HTML",
+                    reply_markup=get_preview_keyboard(post_text)
+                )
+                logger.info("📨 Превью отправлено админу %d", admin_id)
+            except Exception as e:
+                logger.error("Не удалось отправить превью админу %d: %s", admin_id, e)
+    else:
+        # Auto-publish without preview
+        await publish_to_channel(bot, config, post_text)
+
+
+async def publish_to_channel(bot: Bot, config: Config, post_text: str):
+    """Publish post directly to the channel."""
+    try:
+        await bot.send_message(
+            config.CHANNEL_ID,
+            post_text,
+            parse_mode="HTML",
+            disable_web_page_preview=False
+        )
+        logger.info("✅ Пост опубликован в канал %s", config.CHANNEL_ID)
+        return True
+    except Exception as e:
+        logger.error("Ошибка публикации в канал: %s", e)
+        return False
